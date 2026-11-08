@@ -1,0 +1,27 @@
+Create a desktop counter application with a graphical user interface in the current directory. The directory is empty: do NOT call list_dir.
+
+Step 1: Call write_file with path "gui_app.py". Use ONLY the Python standard library (tkinter). Write EXACTLY this file:
+
+import tkinter as tk
+
+class CounterApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title('GUI Counter')
+        self.count = 0
+        self.label = tk.Label(self, text='0', font=('Segoe UI', 32))
+        self.label.pack(padx=40, pady=20)
+        tk.Button(self, text='+1', font=('Segoe UI', 16), command=self.increment).pack(pady=10)
+
+    def increment(self):
+        self.count += 1
+        self.label.config(text=str(self.count))
+
+if __name__ == '__main__':
+    CounterApp().mainloop()
+
+Step 2: Call run_powershell with the command "python -m py_compile gui_app.py". When compilation succeeds the output is EMPTY; empty output means SUCCESS. Do not create gui_app.exe or any other file.
+
+Step 3: Report completion in Korean and stop.
+
+Each step MUST be an actual tool call, not an explanation. You must call write_file exactly once and run_powershell exactly once before your final report. Do not output "Success" yourself; only real tool results are valid.

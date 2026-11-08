@@ -425,10 +425,55 @@ def _repair_pseudo_json(text: str) -> str:
     )
     return text
 
+def _json_unescape_relaxed(raw: str) -> str:
+    """JSON 문자열 본문을 관대하게 디코드한다. (알 수 없는 이스케이프는 그대로 유지)"""
+    simple = {'"': '"', "\\": "\\", "/": "/", "n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f"}
+    out = []
+    i = 0
+    while i < len(raw):
+        char = raw[i]
+        if char == "\\" and i + 1 < len(raw):
+            nxt = raw[i + 1]
+            if nxt in simple:
+                out.append(simple[nxt])
+                i += 2
+                continue
+            if nxt == "u" and i + 5 < len(raw):
+                try:
+                    out.append(chr(int(raw[i + 2:i + 6], 16)))
+                    i += 6
+                    continue
+                except ValueError:
+                    pass
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+def _repair_unescaped_quotes(text: str) -> str:
+    """긴 코드 문자열(content) 안의 이스케이프되지 않은 따옴표를 표준 JSON으로 재인코딩한다.
+
+    경량 모델이 write_file 인자에서 코드 일부의 따옴표만 이스케이프해 JSON이 깨지는 경우를 복구한다.
+    content가 마지막 키일 때만 적용한다.
+    """
+    match = re.search(r'"content"\s*:\s*"', text)
+    if not match:
+        return text
+
+    start = match.end()
+    end = text.rfind('"')
+    if end <= start:
+        return text
+    if not re.fullmatch(r"\s*}\s*}\s*", text[end + 1:]) and not re.fullmatch(r"\s*}\s*", text[end + 1:]):
+        return text
+
+    decoded = _json_unescape_relaxed(text[start:end])
+    escaped = json.dumps(decoded, ensure_ascii=False)[1:-1]
+    return text[:start] + escaped + text[end:]
+
 def extract_fallback_tool_calls(content: str) -> list:
     """llama-server가 tool_calls 대신 일반 텍스트(```json)로 뱉었을 때 추출하는 보조 함수
 
-    비정상 JSON(Python triple-quote/백틱 문자열)은 복구 후 재파싱을 시도한다.
+    비정상 JSON(Python triple-quote/백틱 문자열, 미이스케이프 따옴표)은 복구 후 재파싱을 시도한다.
     """
     if not content:
         return []
@@ -437,7 +482,12 @@ def extract_fallback_tool_calls(content: str) -> list:
     json_str = match.group(1) if match else content.strip()
 
     data = None
-    candidates = [json_str, _repair_pseudo_json(json_str)]
+    base_candidates = [json_str, _repair_pseudo_json(json_str)]
+    candidates = list(base_candidates)
+    for candidate in base_candidates:
+        repaired = _repair_unescaped_quotes(candidate)
+        if repaired not in candidates:
+            candidates.append(repaired)
     for candidate in candidates:
         try:
             data = json.loads(candidate)
