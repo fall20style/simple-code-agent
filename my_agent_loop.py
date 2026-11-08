@@ -1,4 +1,5 @@
 import os
+import ast
 import glob as glob_module
 import fnmatch
 import json
@@ -397,24 +398,68 @@ def trim_context(messages: list) -> list:
     return [messages[0]] + messages[-(MAX_HISTORY - 1):]
 
 # 8. 텍스트 JSON 출력 폴백 파서
+def looks_like_tool_call(content: str) -> bool:
+    """일반 텍스트 안에 도구 호출 JSON 의도가 보이는지 판별 (파싱 실패 피드백용)"""
+    if not content:
+        return False
+    return bool(re.search(r'"name"\s*:', content) and re.search(r'"arguments"\s*:', content))
+
+def _repair_pseudo_json(text: str) -> str:
+    """경량 모델이 코드를 백틱/삼중따옴표로 감싸 만든 비정상 JSON을 표준 JSON으로 복구한다."""
+    def replace_value(match: re.Match) -> str:
+        key = json.dumps(match.group(1))
+        value = json.dumps(match.group(2), ensure_ascii=False)
+        return f"{key}: {value}"
+
+    text = re.sub(
+        r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"""(.*?)"""',
+        replace_value, text, flags=re.DOTALL,
+    )
+    text = re.sub(
+        r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*```(.*?)```',
+        replace_value, text, flags=re.DOTALL,
+    )
+    text = re.sub(
+        r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*`(.*?)`',
+        replace_value, text, flags=re.DOTALL,
+    )
+    return text
+
 def extract_fallback_tool_calls(content: str) -> list:
-    """llama-server가 tool_calls 대신 일반 텍스트(```json)로 뱉었을 때 추출하는 보조 함수"""
+    """llama-server가 tool_calls 대신 일반 텍스트(```json)로 뱉었을 때 추출하는 보조 함수
+
+    비정상 JSON(Python triple-quote/백틱 문자열)은 복구 후 재파싱을 시도한다.
+    """
     if not content:
         return []
 
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
     json_str = match.group(1) if match else content.strip()
 
-    try:
-        data = json.loads(json_str)
-        if isinstance(data, dict) and "name" in data and "arguments" in data:
-            return [{
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "name": data["name"],
-                "arguments": data["arguments"] if isinstance(data["arguments"], str) else json.dumps(data["arguments"], ensure_ascii=False)
-            }]
-    except Exception:
-        pass
+    data = None
+    candidates = [json_str, _repair_pseudo_json(json_str)]
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+            break
+        except Exception:
+            pass
+    if data is None:
+        for candidate in candidates:
+            try:
+                data = ast.literal_eval(candidate)
+                break
+            except Exception:
+                pass
+    if data is None:
+        return []
+
+    if isinstance(data, dict) and "name" in data and "arguments" in data:
+        return [{
+            "id": f"call_{uuid.uuid4().hex[:8]}",
+            "name": data["name"],
+            "arguments": data["arguments"] if isinstance(data["arguments"], str) else json.dumps(data["arguments"], ensure_ascii=False)
+        }]
     return []
 
 # 9. 에이전트 루프
@@ -450,6 +495,9 @@ Available tools:
 Prefer list_dir/glob/grep to explore the project before reading files or guessing paths.
 
 Destructive commands (recursive force delete, disk format, shutdown, etc.) are blocked by a safety filter, so never rely on them.
+Never fabricate tool results (for example, claiming a file was saved) — only real tool output is valid.
+After each tool result, continue with the next required step until the task is complete.
+When the task is complete, reply with a plain-text Korean summary only (no JSON, no tool call). There is no "report" tool.
 Always reply to the user in Korean AFTER you receive the tool execution result.
 
 {project_docs}"""
@@ -492,6 +540,7 @@ def agent_loop():
 
             # 1) 표준 tool_calls 확인
             calls_to_run = []
+            using_text_fallback = False
             if assistant_msg.tool_calls:
                 print(f"\n📡 [LOG] Step {step}: LLM 표준 Tool Calling 동작 감지 (tool_calls 필드)")
                 messages.append(assistant_msg.model_dump(exclude_unset=True))
@@ -507,16 +556,23 @@ def agent_loop():
                 if fallback_calls:
                     print(f"\n⚠️ [LOG] Step {step}: Fallback 파싱 동작 감지 (일반 텍스트에서 JSON 추출)")
                     calls_to_run = fallback_calls
-                    messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": c["id"],
-                            "type": "function",
-                            "function": {"name": c["name"], "arguments": c["arguments"]}
-                        } for c in fallback_calls]
-                    })
+                    using_text_fallback = True
+                    # 모델이 실제로 출력한 텍스트를 그대로 대화에 남겨 다음 턴의 형식을 유지시킨다.
+                    messages.append({"role": "assistant", "content": assistant_msg.content})
                 else:
+                    # 3) 도구 호출 의도는 보이지만 파싱에 실패한 경우 자가 수정 요청
+                    if looks_like_tool_call(assistant_msg.content):
+                        print(f"\n⚠️ [LOG] Step {step}: Tool call JSON 파싱 실패 → 자가 수정 요청")
+                        messages.append({"role": "assistant", "content": assistant_msg.content})
+                        messages.append({
+                            "role": "user",
+                            "content": "[JSON parse error] Your tool call was not valid JSON. "
+                                       "Re-send exactly one valid JSON object with \"name\" and \"arguments\". "
+                                       "Escape newlines inside string values as \\n and quotes as \\\", "
+                                       "and do not use triple quotes."
+                        })
+                        continue
+
                     # 일반 텍스트 최종 답변인 경우 출력 후 내부 루프 종료
                     print(f"\n💬 [LOG] Step {step}: 일반 텍스트 최종 응답 (도구 호출 없음)")
                     messages.append({"role": "assistant", "content": assistant_msg.content})
@@ -538,11 +594,19 @@ def agent_loop():
                 except Exception as e:
                     tool_output = f"Tool execution error: {str(e)}"
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "content": str(tool_output)[:MAX_TOOL_OUTPUT]
-                })
+                if using_text_fallback:
+                    messages.append({
+                        "role": "user",
+                        "content": f"[Tool result: {func_name}]\n{str(tool_output)[:MAX_TOOL_OUTPUT]}\n\n"
+                                   "Continue with the next step of the user's request using a tool call. "
+                                   "Do not repeat a tool call that already succeeded."
+                    })
+                else:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call["id"],
+                        "content": str(tool_output)[:MAX_TOOL_OUTPUT]
+                    })
         else:
             print(f"\n⚠️ 최대 작업 단계({MAX_STEPS}회)에 도달하여 루프를 중단했습니다.")
 

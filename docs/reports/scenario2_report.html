@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>시나리오 2 · 계산기 모듈 생성 및 실행 검증</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 40px 24px 56px;
+    background: linear-gradient(180deg, #eef3fb 0%, #f7f9fc 45%, #ffffff 100%);
+    color: #16202e;
+    font-family: "Malgun Gothic", "Segoe UI", system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 1080px; margin: 0 auto; }
+  header { padding: 8px 4px 26px; border-bottom: 2px solid #dce5f3; }
+  .eyebrow {
+    font-size: 12px; letter-spacing: 2.4px; font-weight: 700;
+    color: #2563eb; margin-bottom: 12px;
+  }
+  h1 { margin: 0 0 12px; font-size: 34px; line-height: 1.25; letter-spacing: -0.6px; }
+  .lede { margin: 0 0 20px; color: #4b5b70; font-size: 15px; line-height: 1.7; max-width: 860px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 13px; border-radius: 999px; font-size: 12.5px; font-weight: 700;
+    background: #eef2f8; color: #33455c; border: 1px solid #dbe4f1;
+  }
+  .badge.pass { background: #e7f8ef; color: #117a45; border-color: #b9ebd0; }
+  .badge.pass::before { content: "✓"; font-size: 14px; }
+  .meta {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+    margin: 26px 0 4px;
+  }
+  .meta div {
+    background: #fff; border: 1px solid #e2e9f4; border-radius: 12px;
+    padding: 13px 15px; box-shadow: 0 1px 2px rgba(22, 32, 46, .04);
+  }
+  .meta span { display: block; font-size: 10.5px; letter-spacing: 1.1px; color: #7b8aa0; font-weight: 700; margin-bottom: 6px; }
+  .meta strong { font-size: 12.5px; font-weight: 600; word-break: break-all; }
+  section { margin-top: 30px; }
+  h2 {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 18px; margin: 0 0 12px; letter-spacing: -0.2px;
+  }
+  h2::before { content: ""; width: 4px; height: 18px; border-radius: 2px; background: #2563eb; }
+  .small { font-size: 12px; color: #117a45; font-weight: 700; background: #e7f8ef; padding: 3px 9px; border-radius: 999px; }
+  .prompt {
+    margin: 0; padding: 20px 22px; border-radius: 14px;
+    background: #0f172a; color: #d7e3f4;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 12.5px; line-height: 1.75; white-space: pre-wrap;
+    box-shadow: 0 8px 24px rgba(15, 23, 42, .16);
+  }
+  table { width: 100%; border-collapse: separate; border-spacing: 0; background: #fff; border: 1px solid #e2e9f4; border-radius: 14px; overflow: hidden; }
+  th, td { padding: 13px 16px; text-align: left; font-size: 13px; border-bottom: 1px solid #edf1f7; }
+  thead th { background: #f4f7fc; color: #5a6b82; font-size: 11px; letter-spacing: 1px; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.step { font-weight: 700; color: #2563eb; width: 70px; }
+  td.time { color: #6b7b90; font-variant-numeric: tabular-nums; white-space: nowrap; width: 110px; }
+  code, .mono { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
+  code { background: #eef2f8; padding: 2px 6px; border-radius: 5px; color: #1d4ed8; }
+  .pill { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 700; background: #e7f8ef; color: #117a45; }
+  ul.checks { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 9px 14px; }
+  ul.checks li {
+    display: flex; align-items: center; gap: 9px;
+    background: #fff; border: 1px solid #e2e9f4; border-radius: 10px;
+    padding: 11px 14px; font-size: 13px;
+  }
+  ul.checks .tick {
+    flex: none; width: 20px; height: 20px; border-radius: 50%;
+    display: grid; place-items: center; background: #e7f8ef; color: #117a45;
+    font-size: 11px; font-weight: 800;
+  }
+  .terminal { background: #0f172a; border-radius: 14px; overflow: hidden; box-shadow: 0 8px 24px rgba(15, 23, 42, .16); }
+  .term-bar { padding: 9px 15px; background: #1e293b; color: #94a3b8; font-size: 11.5px; letter-spacing: .4px; }
+  .terminal pre { margin: 0; padding: 18px 20px; color: #d7e3f4; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12.5px; line-height: 1.8; }
+  .terminal .ps { color: #60a5fa; font-weight: 700; }
+  .terminal .ok { color: #4ade80; font-weight: 700; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .two-col section { margin-top: 0; }
+  .file {
+    background: #fff; border: 1px solid #e2e9f4; border-radius: 12px; overflow: hidden;
+    box-shadow: 0 1px 2px rgba(22, 32, 46, .04);
+  }
+  .file .name { padding: 9px 14px; background: #f4f7fc; border-bottom: 1px solid #edf1f7; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; font-weight: 700; color: #33455c; }
+  .file pre { margin: 0; padding: 14px 16px; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; line-height: 1.65; color: #1e293b; }
+  footer { margin-top: 34px; padding-top: 16px; border-top: 1px solid #e2e9f4; color: #7b8aa0; font-size: 11.5px; line-height: 1.8; }
+  footer strong { color: #4b5b70; }
+</style>
+</head>
+<body>
+<main class="page">
+  <header>
+    <div class="eyebrow">LOCAL LLM INTEGRATION TEST · SCENARIO 2</div>
+    <h1>계산기 모듈 생성 및 실행 검증</h1>
+    <p class="lede">
+      로컬 llama-server(Qwen2.5-Coder-3B)가 스스로 <code>calc.py</code>와 <code>test_calc.py</code>를 생성하고,
+      테스트를 실행해 <strong>ALL TESTS PASSED</strong> 출력까지 확인한 실제 통합 테스트입니다.
+    </p>
+    <div class="badges">
+      <span class="badge pass">PASS 8/8</span>
+      <span class="badge">2026-11-08 10:58:09 → 10:58:41 (KST)</span>
+      <span class="badge">4 steps</span>
+      <span class="badge">실제 API 호출</span>
+    </div>
+  </header>
+
+  <div class="meta">
+    <div><span>MODEL</span><strong>qwen2.5-coder-3b-instruct</strong></div>
+    <div><span>ENDPOINT</span><strong>http://localhost:8000/v1</strong></div>
+    <div><span>PROMPT</span><strong>prompts/scenario2_calculator.txt</strong></div>
+    <div><span>RAW LOG</span><strong>test_results/scenario2_20261108_105809.txt</strong></div>
+  </div>
+
+  <section>
+    <h2>요구사항 프롬프트</h2>
+    <pre class="prompt">Create a small calculator module from scratch in the current directory.
+The directory is empty: do NOT call list_dir.
+
+Step 1: Call write_file with path "calc.py". The content must define:
+  add(a, b), subtract(a, b), multiply(a, b), divide(a, b)
+  divide(a, b): if b == 0, raise ValueError("division by zero")
+
+Step 2: Call write_file with path "test_calc.py".
+  The file MUST start with `import calc` and use plain assert statements.
+  Do NOT use unittest or pytest.
+
+  import calc
+
+  assert calc.add(2, 3) == 5
+  assert calc.subtract(7, 4) == 3
+  assert calc.multiply(6, 7) == 42
+  assert calc.divide(8, 2) == 4
+  print("ALL TESTS PASSED")
+
+Step 3: Call run_powershell with the command "python test_calc.py".
+
+Step 4: If the output contains "ALL TESTS PASSED", report completion in Korean.
+
+Each step MUST be an actual tool call, not an explanation.</pre>
+  </section>
+
+  <section>
+    <h2>실행 타임라인</h2>
+    <table>
+      <thead>
+        <tr><th>STEP</th><th>시각 (KST)</th><th>도구 호출</th><th>결과</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="step">01</td><td class="time">10:58:09</td>
+          <td><code>write_file</code> → <code>calc.py</code></td>
+          <td><span class="pill">saved</span> 4개 연산 함수 + ValueError 처리</td>
+        </tr>
+        <tr>
+          <td class="step">02</td><td class="time">10:58:22</td>
+          <td><code>write_file</code> → <code>test_calc.py</code></td>
+          <td><span class="pill">saved</span> import calc + assert 4건</td>
+        </tr>
+        <tr>
+          <td class="step">03</td><td class="time">10:58:31</td>
+          <td><code>run_powershell</code> → <code>python test_calc.py</code></td>
+          <td><span class="pill">ALL TESTS PASSED</span></td>
+        </tr>
+        <tr>
+          <td class="step">04</td><td class="time">10:58:36</td>
+          <td>최종 텍스트 응답</td>
+          <td>한국어 완료 보고 · 도구 호출 없이 종료</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>검증 결과 <span class="small">8 / 8 PASS</span></h2>
+    <ul class="checks">
+      <li><span class="tick">✓</span>calc.py 생성됨</li>
+      <li><span class="tick">✓</span>test_calc.py 생성됨</li>
+      <li><span class="tick">✓</span>add / subtract / multiply / divide 정의됨</li>
+      <li><span class="tick">✓</span>0 나누기 ValueError 코드 포함</li>
+      <li><span class="tick">✓</span>write_file 도구 실제 사용</li>
+      <li><span class="tick">✓</span>테스트 출력에 ALL TESTS PASSED 포함</li>
+      <li><span class="tick">✓</span>독립 검증: 계산 결과 <code>5 3 42 4</code></li>
+      <li><span class="tick">✓</span>독립 검증: 0으로 나누면 ValueError 발생</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>테스트 실행 결과</h2>
+    <div class="terminal">
+      <div class="term-bar">PowerShell — 작업 디렉토리 (임시 워크스페이스)</div>
+      <pre><span class="ps">PS&gt;</span> python test_calc.py
+<span class="ok">ALL TESTS PASSED</span></pre>
+    </div>
+  </section>
+
+  <div class="two-col">
+    <section>
+      <h2>calc.py</h2>
+      <div class="file">
+        <div class="name">calc.py</div>
+<pre>def add(a, b):
+    return a + b
+
+def subtract(a, b):
+    return a - b
+
+def multiply(a, b):
+    return a * b
+
+def divide(a, b):
+    if b == 0:
+        raise ValueError("division by zero")
+    else:
+        return a / b</pre>
+      </div>
+    </section>
+    <section>
+      <h2>test_calc.py</h2>
+      <div class="file">
+        <div class="name">test_calc.py</div>
+<pre>import calc
+
+assert calc.add(2, 3) == 5
+assert calc.subtract(7, 4) == 3
+assert calc.multiply(6, 7) == 42
+assert calc.divide(8, 2) == 4
+print("ALL TESTS PASSED")</pre>
+      </div>
+    </section>
+  </div>
+
+  <footer>
+    <strong>실행 명령</strong> python test_live_llm.py 2 &nbsp;·&nbsp;
+    <strong>요청/응답 로그</strong> test_results/scenario2_20261108_105809.txt<br>
+    매 스텝의 LLM 요청 messages, 응답 원문 JSON, 도구 실행 결과, 시작/종료 시각이 원본 로그에 기록되어 있습니다.
+  </footer>
+</main>
+</body>
+</html>

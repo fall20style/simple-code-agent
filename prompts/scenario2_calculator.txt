@@ -1,0 +1,25 @@
+Create a small calculator module from scratch in the current directory. The directory is empty: do NOT call list_dir.
+
+Step 1: Call write_file with path "calc.py". The content must define these functions:
+- add(a, b): returns a + b
+- subtract(a, b): returns a - b
+- multiply(a, b): returns a * b
+- divide(a, b): if b == 0, raise ValueError("division by zero"); otherwise returns a / b
+
+Step 2: Call write_file with path "test_calc.py". The file MUST start with the line `import calc` and use plain assert statements. Do NOT use unittest or pytest. Use exactly this structure:
+
+import calc
+
+assert calc.add(2, 3) == 5
+assert calc.subtract(7, 4) == 3
+assert calc.multiply(6, 7) == 42
+assert calc.divide(8, 2) == 4
+print("ALL TESTS PASSED")
+
+Step 3: Call run_powershell with the command "python test_calc.py".
+
+Step 4: If the output contains "ALL TESTS PASSED", report completion in Korean.
+
+Each step MUST be an actual tool call, not an explanation. Do not describe the code without calling write_file.
+You must call write_file twice (first calc.py, then test_calc.py) and run_powershell once before your final report.
+Do not output "Success" yourself; only real tool results are valid. Do not stop after the first file.

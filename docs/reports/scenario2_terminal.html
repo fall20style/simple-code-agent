@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>시나리오 2 실제 실행 로그</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 42px;
+    background: radial-gradient(1200px 600px at 20% 0%, #16213c 0%, #0b1020 55%, #070b14 100%);
+    font-family: "Malgun Gothic", "Segoe UI", system-ui, sans-serif;
+  }
+  .window {
+    max-width: 1120px; margin: 0 auto; border-radius: 16px; overflow: hidden;
+    border: 1px solid #26324a; box-shadow: 0 30px 90px rgba(0, 0, 0, .55);
+  }
+  .bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 13px 18px; background: #1a2336; color: #8ea1bf;
+    font-size: 12px; letter-spacing: .3px;
+  }
+  .dots span { width: 11px; height: 11px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .r { background: #ff5f57; } .y { background: #febc2e; } .g { background: #28c840; }
+  .path { margin-left: 10px; font-family: "Cascadia Mono", Consolas, monospace; color: #a9bad4; }
+  pre {
+    margin: 0; padding: 24px 26px; background: #0d1424; color: #cdd9ea;
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 13px; line-height: 1.78; white-space: pre-wrap; word-break: break-word;
+  }
+  .ok { color: #4ade80; font-weight: 700; }
+  .sec { color: #67e8f9; }
+  .dim { color: #64748b; }
+</style>
+</head>
+<body>
+  <div class="window">
+    <div class="bar">
+      <div class="dots"><span class="r"></span><span class="y"></span><span class="g"></span></div>
+      <span class="path">test_results/scenario2_20261108_105809.txt</span>
+    </div>
+    <pre>========================================================================
+로컬 LLM 통합 테스트 — 시나리오 2: 계산기 모듈 생성 및 실행 검증
+테스트 시작 일시: 2026-11-08 10:58:09 +0900
+모델: qwen2.5-coder-3b-instruct
+API 엔드포인트: http://localhost:8000/v1/
+요구사항 프롬프트 파일: C:\Users\fall2\work\simple-coding-agent\prompts\scenario2_calculator.txt
+작업 디렉토리: C:\Users\fall2\AppData\Local\Temp\agent_live_scenario2_buczpram
+========================================================================
+
+… (중략: 매 스텝의 LLM 요청/응답은 원본 로그 참조) …
+
+<span class="sec">[최종 검증]</span>
+검증 시각: 2026-11-08 10:58:39 +0900
+<span class="sec">--- 작업 디렉토리 파일 목록 ---</span>
+Directory: C:\Users\fall2\AppData\Local\Temp\agent_live_scenario2_buczpram
+__pycache__/
+calc.py
+test_calc.py
+
+<span class="sec">--- calc.py ---</span>
+
+def add(a, b):
+    return a + b
+
+def subtract(a, b):
+    return a - b
+
+def multiply(a, b):
+    return a * b
+
+def divide(a, b):
+    if b == 0:
+        raise ValueError(&quot;division by zero&quot;)
+    else:
+        return a / b
+
+<span class="sec">--- test_calc.py ---</span>
+
+import calc
+
+assert calc.add(2, 3) == 5
+assert calc.subtract(7, 4) == 3
+assert calc.multiply(6, 7) == 42
+assert calc.divide(8, 2) == 4
+print(&quot;ALL TESTS PASSED&quot;)
+
+<span class="sec">[python test_calc.py 실행 결과]</span>
+<span class="dim">STDOUT:</span>
+<span class="ok">ALL TESTS PASSED</span>
+
+<span class="dim">STDERR:</span>
+
+<span class="sec">[독립 검증: 모듈 직접 import]</span>
+<span class="dim">STDOUT:</span>
+5 3 42 4.0
+
+<span class="dim">STDERR:</span>
+
+<span class="sec">[독립 검증: 0으로 나누기]</span>
+<span class="dim">STDOUT:</span>
+VALUE_ERROR
+
+<span class="dim">STDERR:</span>
+
+<span class="sec">--- 검증 항목 ---</span>
+<span class="ok">PASS - calc.py 생성됨</span>
+<span class="ok">PASS - test_calc.py 생성됨</span>
+<span class="ok">PASS - add/subtract/multiply/divide 함수 정의됨</span>
+<span class="ok">PASS - 0 나누기 ValueError 코드 포함</span>
+<span class="ok">PASS - write_file 도구 사용</span>
+<span class="ok">PASS - 테스트 실행 결과에 ALL TESTS PASSED 포함</span>
+<span class="ok">PASS - 독립 계산 결과 5 3 42 4</span>
+<span class="ok">PASS - 0으로 나누면 ValueError 발생</span>
+
+<span class="ok">[최종 결과] PASS (8/8)</span>
+테스트 종료 일시: 2026-11-08 10:58:41 +0900
+사용한 도구 순서: [&#x27;write_file&#x27;, &#x27;write_file&#x27;, &#x27;run_powershell&#x27;]
+========================================================================</pre>
+  </div>
+</body>
+</html>
