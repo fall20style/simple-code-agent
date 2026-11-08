@@ -116,3 +116,64 @@
 8. **중단된 작업 재개(Session Persistence / `--resume`)**
    * **필요성:** 터미널 종료나 예기치 않은 중단 후에도 이전 대화 상태와 작업 이력을 그대로 이어서 진행.
    * **구현 방향:** 현재 `messages` 배열과 `workspace` 상태를 JSON 파일로 직렬화하여 저장하고 `--resume` 플래그로 복원.
+
+
+
+# 📋 에이전트 하네스(Agent Harness) 전체 기능 목록 (DONE / TODO)
+
+> **진행 현황 요약:** 전체 30개 핵심 기능 중 **DONE 20개 (66.7%)** / **TODO 10개 (33.3%)**
+
+---
+
+## 1. 실행 루프 및 상태 제어 (Execution Loop & State Control)
+* **1. [DONE]** ReAct / Tool-Use 반복 실행 루프 제어 (`Thought → Action → Observation`)
+* **2. [DONE]** 최대 실행 단계(`MAX_STEPS`) 제한 및 강제 종료 처리
+* **3. [DONE]** 실시간 스트리밍 출력 및 토큰 생성 경과 시간 표시 (`stream_chat_completion`)
+* **4. [DONE]** 동일 문자/토큰 연속 반복 출력(Degeneration) 조기 감지 및 중단
+* **5. [TODO]** 동일 도구·동일 인자 무한 반복 호출(Stuck Loop) 감지 및 차단
+* **6. [TODO]** 대화 히스토리 및 작업 상태 저장/복원 (`--continue`, `--resume` 세션 체크포인트)
+
+---
+
+## 2. 도구(Tools) 인터페이스 및 코드 조작 (Tooling & Code Manipulation)
+* **7. [DONE]** 디렉터리 탐색 및 파일 검색 도구 (`list_dir`, `glob`, `grep`)
+* **8. [DONE]** 파일 전체 읽기/쓰기/부분 치환 도구 (`read_file`, `write_file`, `edit_file`)
+* **9. [TODO]** 대용량 파일 부분 읽기 지원 (`start_line`, `end_line` 기반 라인 범위 조회 및 줄 번호 표시)
+* **10. [TODO]** 파일 수정 전 자동 스냅샷 백업 및 작업 실패 시 롤백(`/undo`) 기능
+* **11. [TODO]** 코드 저장 직후 정적 구문/린트 사전 검증 (`ast.parse`, `ruff` 등 실행 전 문법 오류 즉시 피드백)
+* **12. [DONE]** 멀티 에이전트 역할 분리 및 작업 위임 (`Planner` / `Worker` / `Reviewer` 오케스트레이션)
+
+---
+
+## 3. 파싱 및 자가 수정 복구 (Parsing & Self-Correction)
+* **13. [DONE]** 표준 OpenAI Tool Calling(`tool_calls`) 및 텍스트 기반 폴백(Fallback) JSON 이중 파싱
+* **14. [DONE]** 추론 태그(`<think>...</think>`) 및 마크다운 코드 블록 자동 정제
+* **15. [DONE]** 비표준 JSON(삼중 따옴표, 백틱, 이스케이프 누락 등) 자동 복구 파서 (`_repair_pseudo_json`)
+* **16. [DONE]** 도구 실행 실패 및 셸 에러(`STDERR`) 자동 피드백 기반 자가 수정 루프
+
+---
+
+## 4. 보안 및 권한 통제 가드레일 (Security & Guardrails)
+* **17. [DONE]** 작업 디렉터리 격리(`--workspace`) 및 상위 경로 탈출(`../`, 심볼릭 링크) 차단
+* **18. [DONE]** 위험 시스템 명령어 정규식 필터링(`Remove-Item -Recurse -Force`, `format`, `shutdown` 등 차단)
+* **19. [TODO]** 민감 파일(`.env`, SSH 키, 인증서 등) 읽기/쓰기 접근 차단
+* **20. [DONE]** 실행 보안 모드 전환 (`INTERACTIVE` 수동 승인 게이트 vs `--auto` 자동 승인 모드)
+* **21. [TODO]** 셸 명령어 화이트리스트/블랙리스트 기반 세분화 권한 정책
+
+---
+
+## 5. 컨텍스트 및 메모리 관리 (Context & Memory Management)
+* **22. [DONE]** 프로젝트 규칙 문서(`AGENT.md`, `CLAUDE.md`, `README.md`) 자동 로드 및 시스템 프롬프트 주입
+* **23. [DONE]** 슬라이딩 윈도우 기반 대화 기록 트리밍(`trim_context`)
+* **24. [TODO]** 장기 대화 시 오래된 도구 실행 결과를 핵심 요약으로 압축하는 컨텍스트 컴팩션(Compaction)
+* **25. [TODO]** 긴 도구 출력(`STDOUT`/`STDERR`)의 앞·뒤 핵심 보존 및 중간 절삭(Truncation)
+
+---
+
+## 6. OS 런타임 및 로컬 LLM 브리지 (Runtime & Serving Bridge)
+* **26. [DONE]** Windows PowerShell 입출력 인코딩(`UTF-8` / `CP949`) 자동 보정
+* **27. [DONE]** GUI 및 백그라운드 프로세스 비동기 실행 감지(무한 대기 타임아웃 방지)
+* **28. [DONE]** 서브프로세스 실행 시간 상한 및 강제 종료(Timeout & Kill) 처리
+* **29. [DONE]** 로컬 추론 서버(`llama-server`) 프록시 우회 및 사고 모드 제어(`/no_think`)
+* **30. [TODO]** 토큰 사용량, 단계별 소요 시간, 성공/실패 이력 구조화 로깅(Audit Log / Telemetry)
+
