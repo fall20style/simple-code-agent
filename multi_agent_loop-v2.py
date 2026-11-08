@@ -1,9 +1,9 @@
-import argparse
-import ast
-import fnmatch
-import glob as glob_module
-import json
 import os
+import ast
+import argparse
+import glob as glob_module
+import fnmatch
+import json
 import re
 import subprocess
 import sys
@@ -25,6 +25,10 @@ os.environ["no_proxy"] = "localhost,127.0.0.1"
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="local-key")
 MODEL_NAME = "Qwen3-4B-Q4_K_M.gguf"
 
+# 역할별 max_tokens 안전 상한 설정 (무한 반복 루프 시 대기 시간 최소화)
+MAX_TOKENS_ORCHESTRATOR = 768
+MAX_TOKENS_SUBAGENT = 2048
+
 MAX_ORCHESTRATOR_STEPS = 8
 MAX_SUBAGENT_STEPS = 6
 MAX_HISTORY = 24
@@ -41,9 +45,9 @@ MAX_GREP_FILE_BYTES = 1_000_000
 MAX_GREP_LINE_CHARS = 300
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".idea", ".vscode"}
 
-# 전역 런타임 설정 (CLI 플래그로 제어)
+# 런타임 전역 설정 (CLI 인자로 초기화)
 AUTO_APPROVE = False
-WORKSPACE_DIR = os.path.abspath(".")
+WORKSPACE_ROOT = os.path.abspath(".")
 
 # 2. 기본 작업 도구 스키마 (서브 에이전트용)
 BASE_TOOLS = [
@@ -51,10 +55,10 @@ BASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the text content of a file at the given path (relative to workspace).",
+            "description": "Read the text content of a file at the given path inside workspace.",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "File path to read"}},
+                "properties": {"path": {"type": "string", "description": "Relative file path inside workspace"}},
                 "required": ["path"]
             }
         }
@@ -63,7 +67,7 @@ BASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "list_dir",
-            "description": "List files and subdirectories of a directory within workspace. Directories end with '/'.",
+            "description": "List files and subdirectories of a directory inside workspace. Directories end with '/'.",
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string", "description": "Directory path (default: '.')"}},
@@ -75,7 +79,7 @@ BASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "glob",
-            "description": "Find files/directories by glob pattern within workspace, e.g. '**/*.py'.",
+            "description": "Find files/directories by glob pattern inside workspace, e.g. '**/*.py'.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -90,7 +94,7 @@ BASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "grep",
-            "description": "Search file contents with a regular expression within workspace.",
+            "description": "Search file contents with a regular expression inside workspace.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -106,11 +110,11 @@ BASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write or overwrite full content to a file within workspace.",
+            "description": "Write or overwrite full content to a file inside workspace.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path to save"},
+                    "path": {"type": "string", "description": "Relative file path inside workspace"},
                     "content": {"type": "string", "description": "Full text/code content to write"}
                 },
                 "required": ["path", "content"]
@@ -121,11 +125,11 @@ BASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Replace one exact occurrence of old_str with new_str in an existing file within workspace.",
+            "description": "Replace one exact occurrence of old_str with new_str in an existing file inside workspace.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path to edit"},
+                    "path": {"type": "string", "description": "Relative file path inside workspace"},
                     "old_str": {"type": "string", "description": "Exact existing text to replace"},
                     "new_str": {"type": "string", "description": "New text to replace with"}
                 },
@@ -147,7 +151,6 @@ BASE_TOOLS = [
     }
 ]
 
-# 오케스트레이터 전용 위임 도구 스키마
 ORCHESTRATOR_TOOLS = [
     {
         "type": "function",
@@ -183,7 +186,7 @@ def get_tools_for_role(role: str) -> list:
     allowed = ROLE_ALLOWED_TOOLS.get(role, set())
     return [t for t in BASE_TOOLS if t["function"]["name"] in allowed]
 
-# 3. 안전 필터, 경로 격리 검증 및 프로젝트 문서 로더
+# 3. 안전 필터, 워크스페이스 격리 검증 및 프로젝트 문서 로더
 DANGEROUS_PATTERNS = [
     (r"remove-item\b(?=[^\n]*-recurse)(?=[^\n]*-force)", "Remove-Item -Recurse -Force"),
     (r"\b(?:rm|del|erase|rd|rmdir)\b[^\n]*\s-r(?:ec(?:urse)?)?\b[^\n]*\s-fo(?:rce)?\b", "recursive force delete alias"),
@@ -206,13 +209,23 @@ def check_dangerous_command(command: str):
     return None
 
 def resolve_workspace_path(rel_or_abs_path: str) -> str:
-    """요청된 경로를 WORKSPACE_DIR 내부 절대 경로로 변환하고, 작업 디렉터리 탈출(Path Traversal)을 차단합니다."""
+    """
+    요청된 경로를 WORKSPACE_ROOT 내부의 정규화된 절대 경로로 변환합니다.
+    상위 디렉터리 탈출(../)이나 외부 드라이브/폴더 접근 시 PermissionError를 발생시킵니다.
+    """
     raw = (rel_or_abs_path or ".").strip()
-    candidate = raw if os.path.isabs(raw) else os.path.join(WORKSPACE_DIR, raw)
-    resolved = os.path.abspath(candidate)
-    ws_root = os.path.abspath(WORKSPACE_DIR)
-    if os.path.commonpath([ws_root, resolved]) != ws_root:
-        raise PermissionError(f"Access denied: '{rel_or_abs_path}' is outside workspace '{ws_root}'.")
+    candidate = raw if os.path.isabs(raw) else os.path.join(WORKSPACE_ROOT, raw)
+    resolved = os.path.realpath(candidate)
+    ws_real = os.path.realpath(WORKSPACE_ROOT)
+
+    try:
+        common = os.path.commonpath([ws_real, resolved])
+    except ValueError:
+        raise PermissionError(f"Access denied: '{rel_or_abs_path}' is on a different drive outside workspace.")
+
+    if common != ws_real:
+        raise PermissionError(f"Access denied: '{rel_or_abs_path}' escapes workspace boundary ({ws_real}).")
+
     return resolved
 
 def load_project_docs(base_dir: str) -> str:
@@ -237,7 +250,7 @@ def load_project_docs(base_dir: str) -> str:
         remaining -= limit
     return ("Project instructions:\n" + "\n\n".join(sections)) if sections else ""
 
-# 4. 로컬 탐색 및 파일/셸 도구 구현
+# 4. 로컬 탐색 및 파일/셸 도구 구현 (워크스페이스 격리 적용)
 def _format_path(base_dir: str, path: str) -> str:
     rel = os.path.relpath(path, base_dir)
     return "." if rel == "." else rel.replace(os.sep, "/")
@@ -250,7 +263,7 @@ def _is_binary_file(fpath: str) -> bool:
         return True
 
 def list_dir_tool(path: str = ".") -> str:
-    target = resolve_workspace_path(path)
+    target = resolve_workspace_path(path or ".")
     if not os.path.isdir(target):
         return f"Error: '{path}' is not a directory."
     try:
@@ -264,21 +277,30 @@ def list_dir_tool(path: str = ".") -> str:
     return f"Directory: {path}\n" + "\n".join(lines)
 
 def glob_tool(pattern: str, path: str = ".") -> str:
-    base = resolve_workspace_path(path)
+    base = resolve_workspace_path(path or ".")
     if not os.path.isdir(base):
         return f"Error: '{path}' is not a directory."
     try:
         matches = glob_module.glob(pattern, root_dir=base, recursive=True)
     except (ValueError, re.error) as e:
         return f"Error: invalid glob '{pattern}': {e}"
-    results = sorted({
-        match.replace("\\", "/") + ("/" if os.path.isdir(os.path.join(base, match)) else "")
-        for match in matches if not (set(match.replace("\\", "/").split("/")) & SKIP_DIRS)
-    })
+
+    safe_results = []
+    for match in matches:
+        norm = match.replace("\\", "/")
+        if set(norm.split("/")) & SKIP_DIRS:
+            continue
+        try:
+            full_p = resolve_workspace_path(os.path.join(base, match))
+            safe_results.append(norm + ("/" if os.path.isdir(full_p) else ""))
+        except PermissionError:
+            continue
+
+    results = sorted(set(safe_results))
     return f"Glob '{pattern}':\n" + "\n".join(results[:MAX_GLOB_RESULTS]) if results else f"No matches for '{pattern}'."
 
 def grep_tool(pattern: str, path: str = ".", include: str = "*") -> str:
-    base = resolve_workspace_path(path)
+    base = resolve_workspace_path(path or ".")
     if not os.path.exists(base):
         return f"Error: '{path}' does not exist."
     try:
@@ -301,6 +323,7 @@ def grep_tool(pattern: str, path: str = ".", include: str = "*") -> str:
 
     for fpath in iter_files():
         try:
+            resolve_workspace_path(fpath)
             if os.path.getsize(fpath) > MAX_GREP_FILE_BYTES or _is_binary_file(fpath):
                 continue
             with open(fpath, "r", encoding="utf-8", errors="replace") as f:
@@ -309,15 +332,15 @@ def grep_tool(pattern: str, path: str = ".", include: str = "*") -> str:
                         matches.append(f"{_format_path(rel_base, fpath)}:{lineno}: {line.rstrip()[:MAX_GREP_LINE_CHARS]}")
                         if len(matches) >= MAX_GREP_RESULTS:
                             return "\n".join(matches)
-        except OSError:
+        except (OSError, PermissionError):
             continue
     return "\n".join(matches) if matches else f"No matches for '{pattern}'."
 
-def _request_approval(caller_tag: str, prompt_msg: str) -> bool:
+def request_approval(prompt_text: str, caller_tag: str) -> bool:
     if AUTO_APPROVE:
-        print(f"  ⚡ [{caller_tag} 자동 승인] {prompt_msg.splitlines()[0]}")
+        print(f"  ⚡ [{caller_tag} 자동 승인] {prompt_text}")
         return True
-    confirm = input(f"\n⚠️ [{caller_tag} 승인] {prompt_msg} (y/n): ")
+    confirm = input(f"\n⚠️ [{caller_tag} 승인] {prompt_text} (y/n): ")
     return confirm.lower() == "y"
 
 def execute_base_tool(name: str, args: dict, caller_tag: str = "agent") -> str:
@@ -334,7 +357,7 @@ def execute_base_tool(name: str, args: dict, caller_tag: str = "agent") -> str:
                 return f.read()
         elif name == "write_file":
             target = resolve_workspace_path(args["path"])
-            if not _request_approval(caller_tag, f"'{args['path']}' 파일을 저장할까요?"):
+            if not request_approval(f"'{args['path']}' 파일을 저장할까요?", caller_tag):
                 return "User rejected file write."
             dir_name = os.path.dirname(target)
             if dir_name:
@@ -354,7 +377,7 @@ def execute_base_tool(name: str, args: dict, caller_tag: str = "agent") -> str:
                 return f"Error: 'old_str' not found in '{args['path']}'."
             if occ > 1:
                 return f"Error: 'old_str' appears {occ} times in '{args['path']}'."
-            if not _request_approval(caller_tag, f"'{args['path']}' 파일을 부분 수정할까요?"):
+            if not request_approval(f"'{args['path']}' 파일을 부분 수정할까요?", caller_tag):
                 return "User rejected file edit."
             with open(target, "w", encoding="utf-8") as f:
                 f.write(content.replace(old_str, new_str, 1))
@@ -365,16 +388,16 @@ def execute_base_tool(name: str, args: dict, caller_tag: str = "agent") -> str:
             if danger:
                 print(f"\n🚫 [{caller_tag} 차단] 위험 명령어 감지: {danger}\nPS> {cmd}")
                 return f"BLOCKED by safety filter ({danger})."
-            if not _request_approval(caller_tag, f"PowerShell 실행?\nPS> {cmd}"):
+            if not request_approval(f"PowerShell 실행? -> {cmd}", caller_tag):
                 return "User rejected command."
 
-            # Python 스크립트 실행 시 GUI 앱 무한 대기 방지를 위해 Popen으로 비동기 감지
+            # Python 스크립트 실행 시 워크스페이스 내부 파일인지 검증 후 비동기 감지 실행
             py_match = re.match(r'^(?:Start-Process\s+)?python(?:\.exe)?\s+["\']?([^\s"\']+\.py)["\']?$', cmd, re.IGNORECASE)
             if py_match:
                 target_py = resolve_workspace_path(py_match.group(1))
                 proc = subprocess.Popen(
                     [sys.executable, target_py],
-                    cwd=WORKSPACE_DIR,
+                    cwd=WORKSPACE_ROOT,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace"
                 )
@@ -382,28 +405,31 @@ def execute_base_tool(name: str, args: dict, caller_tag: str = "agent") -> str:
                     out, err = proc.communicate(timeout=2.5)
                     return f"ExitCode: {proc.returncode}\nSTDOUT:\n{out}\nSTDERR:\n{err}"
                 except subprocess.TimeoutExpired:
-                    return f"Success: GUI/long-running script '{py_match.group(1)}' launched in workspace and running without errors."
+                    return f"Success: GUI/long-running script '{py_match.group(1)}' launched inside workspace and running without errors."
 
             utf8_cmd = f"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}"
             res = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", utf8_cmd],
-                cwd=WORKSPACE_DIR,
+                cwd=WORKSPACE_ROOT,
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30
             )
             return f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
         return f"Unknown tool: {name}"
+    except PermissionError as pe:
+        print(f"\n🛡️ [격리 차단] {pe}")
+        return f"Security Error: {str(pe)}"
     except Exception as e:
         return f"Execution error: {str(e)}"
 
-# 5. 스트리밍 LLM 호출 헬퍼 (실시간 진행 상황 표시 + /no_think 적용)
-def stream_chat_completion(messages: list, tools: list, temperature: float, label: str) -> dict:
+# 5. 스트리밍 LLM 호출 헬퍼 (역할별 max_tokens 안전 상한 + 실시간 진행 표시)
+def stream_chat_completion(messages: list, tools: list, temperature: float, max_tokens: int, label: str) -> dict:
     start_time = time.time()
     stream = client.chat.completions.create(
         model=MODEL_NAME,
         messages=messages,
         tools=tools,
         temperature=temperature,
-        max_tokens=4096,
+        max_tokens=max_tokens,
         stream=True,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}}
     )
@@ -489,11 +515,11 @@ def extract_fallback_tool_calls(content: str) -> list:
     return []
 
 # 7. 서브 에이전트 실행 엔진 (Planner / Worker / Reviewer)
-def build_subagent_prompt(role: str, workspace_dir: str, project_docs: str) -> str:
+def build_subagent_prompt(role: str, project_docs: str) -> str:
     role_guides = {
         "planner": (
             "You are the PLANNER sub-agent (READ-ONLY). "
-            "Explore the codebase using list_dir, glob, grep, and read_file. "
+            "Explore the workspace using list_dir, glob, grep, and read_file. "
             "Produce a concise, concrete step-by-step implementation plan specifying target files and exact changes. "
             "Prefer Python's built-in `tkinter` for GUI apps unless external libraries are already installed. "
             "Do NOT attempt to modify files."
@@ -501,7 +527,7 @@ def build_subagent_prompt(role: str, workspace_dir: str, project_docs: str) -> s
         "worker": (
             "You are the WORKER sub-agent. "
             "Implement the requested code changes accurately using read_file, edit_file, write_file, and run_powershell. "
-            "Write clean, concise, complete code without unnecessary bloat. Summarize what you changed when done."
+            "Write clean, concise, complete code without unnecessary repetition or bloat. Summarize what you changed when done."
         ),
         "reviewer": (
             "You are the REVIEWER sub-agent. "
@@ -515,8 +541,8 @@ def build_subagent_prompt(role: str, workspace_dir: str, project_docs: str) -> s
 
     return f"""/no_think
 {role_guides[role]}
-Isolated workspace directory: {workspace_dir}
-Use relative paths (e.g. 'tetris.py') inside the workspace. Access outside the workspace is blocked.
+Isolated Workspace Directory: {WORKSPACE_ROOT}
+All file paths MUST be relative to the workspace root (e.g., 'tetris.py', 'src/main.py'). Do NOT access parent directories ('../').
 When calling a tool, respond ONLY with a JSON block:
 ```json
 {{
@@ -527,7 +553,7 @@ When calling a tool, respond ONLY with a JSON block:
 When your sub-task is complete, output a clear plain-text report (no JSON).
 {project_docs}"""
 
-def run_subagent(role: str, task: str, workspace_dir: str, project_docs: str) -> str:
+def run_subagent(role: str, task: str, project_docs: str) -> str:
     if role not in ROLE_ALLOWED_TOOLS:
         return f"Error: invalid sub-agent role '{role}'. Choose from planner, worker, reviewer."
 
@@ -535,12 +561,15 @@ def run_subagent(role: str, task: str, workspace_dir: str, project_docs: str) ->
     tools = get_tools_for_role(role)
     allowed_names = ROLE_ALLOWED_TOOLS[role]
     messages = [
-        {"role": "system", "content": build_subagent_prompt(role, workspace_dir, project_docs)},
+        {"role": "system", "content": build_subagent_prompt(role, project_docs)},
         {"role": "user", "content": task}
     ]
 
     for step in range(1, MAX_SUBAGENT_STEPS + 1):
-        res = stream_chat_completion(messages, tools=tools, temperature=0.15, label=role)
+        res = stream_chat_completion(
+            messages, tools=tools, temperature=0.15,
+            max_tokens=MAX_TOKENS_SUBAGENT, label=role
+        )
         content = res["content"]
         raw_tcs = res["tool_calls"]
         calls = []
@@ -594,10 +623,10 @@ def trim_context(messages: list) -> list:
         return messages
     return [messages[0]] + messages[-(MAX_HISTORY - 1):]
 
-def build_orchestrator_prompt(workspace_dir: str, project_docs: str) -> str:
+def build_orchestrator_prompt(project_docs: str) -> str:
     return f"""/no_think
 You are the ORCHESTRATOR of a Windows multi-agent coding system.
-Isolated workspace directory: {workspace_dir}
+Isolated Workspace Directory: {WORKSPACE_ROOT}
 
 You do NOT edit files or run commands directly. Instead, delegate subtasks using `delegate_task(role, task)`:
 - "planner": Inspects files and creates a step-by-step plan (read-only).
@@ -613,34 +642,15 @@ Typical workflow for coding tasks:
 When all necessary sub-agents have finished, provide a final Korean summary to the user (plain text, no JSON).
 {project_docs}"""
 
-def parse_cli_args():
-    parser = argparse.ArgumentParser(description="Windows Multi-Agent Coding System (Planner / Worker / Reviewer)")
-    parser.add_argument(
-        "--auto",
-        action="store_true",
-        help="파일 저장/수정 및 안전한 PowerShell 명령 실행 시 사용자 승인(y/n)을 생략하고 자동 실행합니다."
-    )
-    parser.add_argument(
-        "--workspace",
-        type=str,
-        default=".",
-        help="에이전트가 작업할 격리된 디렉터리 경로를 지정합니다 (기본값: 현재 디렉터리)."
-    )
-    return parser.parse_args()
-
 def orchestrator_loop():
-    global AUTO_APPROVE, WORKSPACE_DIR
-    args = parse_cli_args()
-    AUTO_APPROVE = args.auto
-    WORKSPACE_DIR = os.path.abspath(args.workspace)
-    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    project_docs = load_project_docs(WORKSPACE_ROOT)
+    messages = [{"role": "system", "content": build_orchestrator_prompt(project_docs)}]
 
-    project_docs = load_project_docs(WORKSPACE_DIR)
-    messages = [{"role": "system", "content": build_orchestrator_prompt(WORKSPACE_DIR, project_docs)}]
-
-    print("🤖 [ORCHESTRATOR] 멀티 에이전트 코딩 시스템 시작 (Planner / Worker / Reviewer)")
-    print(f"📂 작업 디렉터리(Workspace): {WORKSPACE_DIR}")
-    print(f"🛡️ 승인 모드: {'⚡ 자동 승인(--auto)' if AUTO_APPROVE else '👤 수동 승인(y/n)'}")
+    mode_badge = "⚡ AUTO-APPROVE ON" if AUTO_APPROVE else "🔒 INTERACTIVE APPROVAL"
+    print("🤖 [ORCHESTRATOR] 멀티 에이전트 코딩 시스템 v3 시작 (Planner / Worker / Reviewer)")
+    print(f"📂 격리 작업 디렉터리: {WORKSPACE_ROOT}")
+    print(f"🛡️ 실행 보안 모드: {mode_badge}")
+    print(f"⚙️ 토큰 상한 설정: Orchestrator={MAX_TOKENS_ORCHESTRATOR} / Sub-Agent={MAX_TOKENS_SUBAGENT}")
     if project_docs:
         print(f"📚 프로젝트 지침 자동 로드 완료 ({len(project_docs)}자)")
 
@@ -655,7 +665,10 @@ def orchestrator_loop():
         messages = trim_context(messages)
 
         for step in range(1, MAX_ORCHESTRATOR_STEPS + 1):
-            res = stream_chat_completion(messages, tools=ORCHESTRATOR_TOOLS, temperature=0.2, label="orchestrator")
+            res = stream_chat_completion(
+                messages, tools=ORCHESTRATOR_TOOLS, temperature=0.2,
+                max_tokens=MAX_TOKENS_ORCHESTRATOR, label="orchestrator"
+            )
             content = res["content"]
             raw_tcs = res["tool_calls"]
             calls = []
@@ -692,7 +705,7 @@ def orchestrator_loop():
                 else:
                     try:
                         pargs = json.loads(call["arguments"])
-                        out = run_subagent(pargs["role"], pargs["task"], WORKSPACE_DIR, project_docs)
+                        out = run_subagent(pargs["role"], pargs["task"], project_docs)
                     except Exception as e:
                         out = f"Delegation error: {e}"
 
@@ -711,5 +724,25 @@ def orchestrator_loop():
         else:
             print(f"\n⚠️ 오케스트레이터 최대 단계({MAX_ORCHESTRATOR_STEPS}회) 도달")
 
+def parse_cli_args():
+    global AUTO_APPROVE, WORKSPACE_ROOT
+    parser = argparse.ArgumentParser(description="Windows Multi-Agent Coding System v3")
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="파일 쓰기/수정 및 셸 실행 시 사용자 승인(y/n)을 생략하고 자동 실행 (위험 명령어 차단은 항상 유지)"
+    )
+    parser.add_argument(
+        "--workspace",
+        type=str,
+        default=".",
+        help="에이전트가 접근할 수 있는 격리된 작업 디렉터리 경로 (기본값: 현재 디렉터리)"
+    )
+    args = parser.parse_args()
+    AUTO_APPROVE = args.auto
+    WORKSPACE_ROOT = os.path.abspath(args.workspace)
+    os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+
 if __name__ == "__main__":
+    parse_cli_args()
     orchestrator_loop()
