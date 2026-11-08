@@ -4,8 +4,15 @@ import fnmatch
 import json
 import re
 import subprocess
+import sys
 import uuid
 from openai import OpenAI
+
+# Windows 콘솔(cp949)에서 한글/이모지 출력이 깨지거나 예외가 나지 않도록 UTF-8로 고정
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # 1. 실행 중인 llama-server.exe (127.0.0.1:8000) 연결 설정
 client = OpenAI(
@@ -411,11 +418,12 @@ def extract_fallback_tool_calls(content: str) -> list:
     return []
 
 # 9. 에이전트 루프
-def agent_loop():
-    current_dir = os.getcwd()  # 실제 현재 작업 경로 획득
-    project_docs = load_project_docs(current_dir)
+def build_system_prompt(current_dir: str, project_docs: str = None) -> str:
+    """현재 디렉토리와 자동 로드한 프로젝트 지침을 포함한 시스템 프롬프트 생성"""
+    if project_docs is None:
+        project_docs = load_project_docs(current_dir)
 
-    system_prompt = f"""You are an autonomous Windows CLI coding agent.
+    return f"""You are an autonomous Windows CLI coding agent.
 Your current working directory is: {current_dir}
 You MUST use the provided tools to inspect files and run PowerShell commands.
 NEVER guess directory paths or file contents. NEVER tell the user to run a command themselves.
@@ -445,6 +453,11 @@ Destructive commands (recursive force delete, disk format, shutdown, etc.) are b
 Always reply to the user in Korean AFTER you receive the tool execution result.
 
 {project_docs}"""
+
+def agent_loop():
+    current_dir = os.getcwd()  # 실제 현재 작업 경로 획득
+    project_docs = load_project_docs(current_dir)
+    system_prompt = build_system_prompt(current_dir, project_docs)
 
     messages = [{"role": "system", "content": system_prompt}]
 
