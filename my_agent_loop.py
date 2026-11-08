@@ -1,4 +1,6 @@
 import os
+import glob as glob_module
+import fnmatch
 import json
 import re
 import subprocess
@@ -22,6 +24,14 @@ PROJECT_DOC_FILES = ["AGENT.md", "CLAUDE.md", "README.md", "SETUP.md"]
 MAX_DOC_CHARS_PER_FILE = 1200
 MAX_PROJECT_DOC_CHARS = 3000
 
+# 탐색 도구(list_dir/glob/grep) 출력 및 검색 범위 제한
+MAX_LIST_ENTRIES = 200
+MAX_GLOB_RESULTS = 200
+MAX_GREP_RESULTS = 120
+MAX_GREP_FILE_BYTES = 1_000_000
+MAX_GREP_LINE_CHARS = 300
+SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".idea", ".vscode"}
+
 # 2. Windows PowerShell 기반 도구(Tools) JSON 스키마
 TOOLS = [
     {
@@ -35,6 +45,51 @@ TOOLS = [
                     "path": {"type": "string", "description": "File path to read"}
                 },
                 "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List files and subdirectories of a directory. Directories end with '/'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path (default: current directory)"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find files/directories by glob pattern, e.g. '**/*.py' or 'src/**/*.ts'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern such as '**/*.py'"},
+                    "path": {"type": "string", "description": "Base directory to search from (default: current directory)"}
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search file contents with a regular expression and return matching paths, line numbers, and lines.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regular expression to search for"},
+                    "path": {"type": "string", "description": "File or directory to search (default: current directory)"},
+                    "include": {"type": "string", "description": "Only search files matching this glob, e.g. '*.py' (default: '*')"}
+                },
+                "required": ["pattern"]
             }
         }
     },
@@ -139,10 +194,130 @@ def load_project_docs(base_dir: str) -> str:
         return ""
     return "Project instructions (auto-loaded, may be truncated):\n" + "\n\n".join(sections)
 
-# 5. 로컬 도구 실행기 (PowerShell UTF-8 인코딩 및 사용자 승인 포함)
+# 5. 탐색 도구 헬퍼 (list_dir / glob / grep)
+def _format_path(base_dir: str, path: str) -> str:
+    rel = os.path.relpath(path, base_dir)
+    return "." if rel == "." else rel.replace(os.sep, "/")
+
+def _is_binary_file(fpath: str) -> bool:
+    try:
+        with open(fpath, "rb") as f:
+            return b"\x00" in f.read(1024)
+    except OSError:
+        return True
+
+def list_dir_tool(path: str = ".") -> str:
+    target = os.path.abspath(path or ".")
+    if not os.path.isdir(target):
+        return f"Error: '{path}' is not a directory."
+    try:
+        names = os.listdir(target)
+    except OSError as e:
+        return f"Error: cannot list '{path}': {e}"
+
+    if not names:
+        return f"Directory '{path}' is empty."
+
+    names.sort(key=lambda n: (not os.path.isdir(os.path.join(target, n)), n.lower()))
+    lines = []
+    for name in names[:MAX_LIST_ENTRIES]:
+        full = os.path.join(target, name)
+        lines.append(name + "/" if os.path.isdir(full) else name)
+    if len(names) > MAX_LIST_ENTRIES:
+        lines.append(f"... ({len(names) - MAX_LIST_ENTRIES} more entries truncated)")
+    return f"Directory: {path}\n" + "\n".join(lines)
+
+def glob_tool(pattern: str, path: str = ".") -> str:
+    base = os.path.abspath(path or ".")
+    if not os.path.isdir(base):
+        return f"Error: '{path}' is not a directory."
+    try:
+        matches = glob_module.glob(pattern, root_dir=base, recursive=True)
+    except (ValueError, re.error) as e:
+        return f"Error: invalid glob pattern '{pattern}': {e}"
+
+    results = []
+    for match in matches:
+        if set(match.replace("\\", "/").split("/")) & SKIP_DIRS:
+            continue
+        full = os.path.join(base, match)
+        suffix = "/" if os.path.isdir(full) else ""
+        results.append(match.replace("\\", "/") + suffix)
+
+    results = sorted(set(results))
+    if not results:
+        return f"No matches for '{pattern}' under '{path}'."
+    lines = results[:MAX_GLOB_RESULTS]
+    if len(results) > MAX_GLOB_RESULTS:
+        lines.append(f"... ({len(results) - MAX_GLOB_RESULTS} more matches truncated)")
+    return f"Glob '{pattern}' under '{path}':\n" + "\n".join(lines)
+
+def _iter_grep_files(base: str, include: str):
+    if os.path.isfile(base):
+        yield base
+        return
+    for root, dirs, files in os.walk(base):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        for filename in sorted(files):
+            if fnmatch.fnmatch(filename, include):
+                yield os.path.join(root, filename)
+
+def grep_tool(pattern: str, path: str = ".", include: str = "*") -> str:
+    base = os.path.abspath(path or ".")
+    if not os.path.exists(base):
+        return f"Error: '{path}' does not exist."
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        return f"Error: invalid regular expression '{pattern}': {e}"
+
+    include = include or "*"
+    rel_base = base if os.path.isdir(base) else os.path.dirname(base)
+    matches = []
+    scanned = 0
+    limit_hit = False
+
+    for fpath in _iter_grep_files(base, include):
+        scanned += 1
+        try:
+            if os.path.getsize(fpath) > MAX_GREP_FILE_BYTES or _is_binary_file(fpath):
+                continue
+            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                for lineno, line in enumerate(f, 1):
+                    if not regex.search(line):
+                        continue
+                    text = line.rstrip("\r\n")
+                    if len(text) > MAX_GREP_LINE_CHARS:
+                        text = text[:MAX_GREP_LINE_CHARS] + "..."
+                    matches.append(f"{_format_path(rel_base, fpath)}:{lineno}: {text}")
+                    if len(matches) >= MAX_GREP_RESULTS:
+                        limit_hit = True
+                        break
+        except OSError:
+            continue
+        if limit_hit:
+            break
+
+    if not matches:
+        return f"No matches for '{pattern}' under '{path}' (include='{include}')."
+    header = f"Grep '{pattern}' under '{path}' (include='{include}', {scanned} files scanned):"
+    if limit_hit:
+        matches.append(f"... (stopped at {MAX_GREP_RESULTS} matches)")
+    return header + "\n" + "\n".join(matches)
+
+# 6. 로컬 도구 실행기 (PowerShell UTF-8 인코딩 및 사용자 승인 포함)
 def execute_tool(name: str, args: dict) -> str:
     try:
-        if name == "read_file":
+        if name == "list_dir":
+            return list_dir_tool(args.get("path", "."))
+
+        elif name == "glob":
+            return glob_tool(args["pattern"], args.get("path", "."))
+
+        elif name == "grep":
+            return grep_tool(args["pattern"], args.get("path", "."), args.get("include", "*"))
+
+        elif name == "read_file":
             with open(args["path"], "r", encoding="utf-8") as f:
                 return f.read()
 
@@ -208,13 +383,13 @@ def execute_tool(name: str, args: dict) -> str:
     except Exception as e:
         return f"Execution error: {str(e)}"
 
-# 6. 컨텍스트 관리 함수
+# 7. 컨텍스트 관리 함수
 def trim_context(messages: list) -> list:
     if len(messages) <= MAX_HISTORY:
         return messages
     return [messages[0]] + messages[-(MAX_HISTORY - 1):]
 
-# 7. 텍스트 JSON 출력 폴백 파서
+# 8. 텍스트 JSON 출력 폴백 파서
 def extract_fallback_tool_calls(content: str) -> list:
     """llama-server가 tool_calls 대신 일반 텍스트(```json)로 뱉었을 때 추출하는 보조 함수"""
     if not content:
@@ -235,7 +410,7 @@ def extract_fallback_tool_calls(content: str) -> list:
         pass
     return []
 
-# 8. 에이전트 루프
+# 9. 에이전트 루프
 def agent_loop():
     current_dir = os.getcwd()  # 실제 현재 작업 경로 획득
     project_docs = load_project_docs(current_dir)
@@ -256,10 +431,15 @@ When you need information from the system, you MUST respond ONLY with a JSON too
 ```
 
 Available tools:
-1. read_file(path): Read a file.
-2. write_file(path, content): Write or overwrite a file.
-3. edit_file(path, old_str, new_str): Replace one unique occurrence in an existing file (preferred for partial edits).
-4. run_powershell(command): Run a Windows PowerShell command in {current_dir}.
+1. list_dir(path): List files and subdirectories (directories end with '/').
+2. glob(pattern, path): Find paths by glob pattern, e.g. '**/*.py'.
+3. grep(pattern, path, include): Search file contents by regex; returns path:line: text.
+4. read_file(path): Read a file.
+5. write_file(path, content): Write or overwrite a file.
+6. edit_file(path, old_str, new_str): Replace one unique occurrence in an existing file (preferred for partial edits).
+7. run_powershell(command): Run a Windows PowerShell command in {current_dir}.
+
+Prefer list_dir/glob/grep to explore the project before reading files or guessing paths.
 
 Destructive commands (recursive force delete, disk format, shutdown, etc.) are blocked by a safety filter, so never rely on them.
 Always reply to the user in Korean AFTER you receive the tool execution result.
