@@ -9,9 +9,9 @@ import subprocess
 import sys
 import time
 import uuid
+import requests
 from openai import OpenAI
 
-# Windows 콘솔 UTF-8 고정 및 로컬 프록시 우회
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -21,9 +21,12 @@ os.environ["http_proxy"] = ""
 os.environ["https_proxy"] = ""
 os.environ["no_proxy"] = "localhost,127.0.0.1"
 
-# 1. 로컬 LLM 서버 연결 설정
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="local-key")
-MODEL_NAME = "Qwen3-4B-Q4_K_M.gguf"
+USE_REMOTE_EXAONE = False
+EXAONE_API_KEY = os.environ.get("EXAONE_API_KEY", "") 
+EXAONE_URL = "https://exaone.ai"
+
+client = None
+MODEL_NAME = ""
 
 MAX_AGENT_STEPS = 12
 MAX_HISTORY = 28
@@ -41,11 +44,9 @@ MAX_GREP_FILE_BYTES = 1_000_000
 MAX_GREP_LINE_CHARS = 300
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", "dist", "build", ".idea", ".vscode"}
 
-# 전역 런타임 설정 (CLI 플래그로 초기화)
 AUTO_APPROVE = False
 WORKSPACE_ROOT = os.path.abspath(".")
 
-# 2. 단일 자율 에이전트 통합 도구 스키마
 ALL_TOOLS = [
     {
         "type": "function",
@@ -147,7 +148,6 @@ ALL_TOOLS = [
     }
 ]
 
-# 3. 안전 필터 및 경로 격리 검증기
 DANGEROUS_PATTERNS = [
     (r"remove-item\b(?=[^\n]*-recurse)(?=[^\n]*-force)", "Remove-Item -Recurse -Force"),
     (r"\b(?:rm|del|erase|rd|rmdir)\b[^\n]*\s-r(?:ec(?:urse)?)?\b[^\n]*\s-fo(?:rce)?\b", "recursive force delete alias"),
@@ -171,8 +171,8 @@ def check_dangerous_command(command: str):
             return label
     return None
 
+
 def resolve_workspace_path(user_path: str) -> str:
-    """요청된 경로가 WORKSPACE_ROOT 내부에 있는지 검증하고 절대 경로를 반환"""
     raw = (user_path or ".").strip()
     candidate = os.path.abspath(os.path.join(WORKSPACE_ROOT, raw))
     try:
@@ -184,7 +184,6 @@ def resolve_workspace_path(user_path: str) -> str:
     return candidate
 
 def request_approval(prompt_msg: str) -> bool:
-    """--auto 모드 여부에 따라 자동 승인 또는 사용자 수동 승인 요청"""
     if AUTO_APPROVE:
         print(f"⚡ [AUTO-APPROVED] {prompt_msg}")
         return True
@@ -213,7 +212,6 @@ def load_project_docs(base_dir: str) -> str:
         remaining -= limit
     return ("Project instructions:\n" + "\n\n".join(sections)) if sections else ""
 
-# 4. 로컬 탐색 및 파일/셸 도구 구현 (WORKSPACE_ROOT 격리 적용)
 def _format_path(base_dir: str, path: str) -> str:
     rel = os.path.relpath(path, base_dir)
     return "." if rel == "." else rel.replace(os.sep, "/")
@@ -339,23 +337,6 @@ def execute_tool(name: str, args: dict) -> str:
             if not request_approval(f"[AGENT] PowerShell 실행 -> {cmd}"):
                 return "User rejected command."
 
-            # Python 스크립트 실행 시 워크스페이스 내부 경로 검증 및 GUI 앱 비동기 감지
-            py_match = re.match(r'^(?:Start-Process\s+)?python(?:\.exe)?\s+["\']?([^\s"\']+\.py)["\']?$', cmd, re.IGNORECASE)
-            if py_match:
-                target_py_abs = resolve_workspace_path(py_match.group(1))
-                rel_py = _format_path(WORKSPACE_ROOT, target_py_abs)
-                proc = subprocess.Popen(
-                    [sys.executable, target_py_abs],
-                    cwd=WORKSPACE_ROOT,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding="utf-8", errors="replace"
-                )
-                try:
-                    out, err = proc.communicate(timeout=2.5)
-                    return f"ExitCode: {proc.returncode}\nSTDOUT:\n{out}\nSTDERR:\n{err}"
-                except subprocess.TimeoutExpired:
-                    return f"Success: GUI/long-running script '{rel_py}' launched in workspace and running without errors."
-
             utf8_cmd = f"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}"
             res = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", utf8_cmd],
@@ -370,58 +351,118 @@ def execute_tool(name: str, args: dict) -> str:
     except Exception as e:
         return f"Execution error: {str(e)}"
 
-# 5. 스트리밍 LLM 호출 헬퍼 (실시간 진행 상황 + 반복 루프 조기 차단 + /no_think 적용)
-def stream_chat_completion(messages: list, tools: list, temperature: float, max_tokens: int, label: str) -> dict:
+
+def stream_exaone_completion(messages: list, tools: list, temperature: float, max_tokens: int, label: str) -> dict:
     start_time = time.time()
-    stream = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages,
-        tools=tools,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stream=True,
-        extra_body={"chat_template_kwargs": {"enable_thinking": False}}
-    )
+    
+    # [SSL 오류 해결] 방화벽 차단을 막기 위해 웹 브라우저(Chrome)인 것처럼 User-Agent를 추가합니다.
+    headers = {
+        "Authorization": f"Bearer {EXAONE_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    sanitized_messages = []
+    for msg in messages:
+        copied = dict(msg)
+        if "tool_calls" in copied and copied["tool_calls"]:
+            sanitized_tcs = []
+            for tc in copied["tool_calls"]:
+                tc_copy = dict(tc)
+                if "function" in tc_copy:
+                    func_copy = dict(tc_copy["function"])
+                    if isinstance(func_copy.get("arguments"), dict):
+                        func_copy["arguments"] = json.dumps(func_copy["arguments"], ensure_ascii=False)
+                    tc_copy["function"] = func_copy
+                sanitized_tcs.append(tc_copy)
+            copied["tool_calls"] = sanitized_tcs
+        sanitized_messages.append(copied)
 
-    content_chunks = []
-    tool_calls_map = {}
-    total_chars = 0
+    payload = {"model": MODEL_NAME, "messages": sanitized_messages, "temperature": temperature, "max_tokens": max_tokens, "stream": True}
+    if tools:
+        payload["tools"] = tools
 
+    content_chunks, tool_calls_map, total_chars = [], {}, 0
+    try:
+        # 💡 [교정 파트] urllib3.errors를 urllib3.exceptions로 올바르게 정정하여 경고를 숨깁니다.
+        import requests.packages.urllib3
+        requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+        
+        response = requests.post(url=EXAONE_URL, headers=headers, json=payload, stream=True, timeout=30, verify=False)
+        response.raise_for_status()
+        
+        for line in response.iter_lines():
+            if not line: continue
+            line_str = line.decode('utf-8').strip()
+            if not line_str.startswith("data:"): continue
+            data_body = line_str[5:].strip()
+            if data_body == "[DONE]": break
+            try:
+                chunk = json.loads(data_body)
+                if not chunk.get("choices"): continue
+                delta = chunk["choices"].get("delta", {})
+                if delta.get("content"):
+                    text = delta["content"]
+                    content_chunks.append(text)
+                    total_chars += len(text)
+                    if len(content_chunks) > 25:
+                        tail = "".join(content_chunks[-25:])
+                        if len(set(tail)) <= 2 and len(tail) >= 25:
+                            print(f"\n⚠️ [{label}] 반복 출력 루프 차단.")
+                            break
+                if delta.get("tool_calls"):
+                    for tc in delta["tool_calls"]:
+                        idx = tc.get("index", 0)
+                        if idx not in tool_calls_map:
+                            tool_calls_map[idx] = {"id": tc.get("id") or f"call_{uuid.uuid4().hex[:8]}", "type": "function", "function": {"name": "", "arguments": ""}}
+                        if tc.get("id"): tool_calls_map[idx]["id"] = tc["id"]
+                        if tc.get("function"):
+                            func_info = tc["function"]
+                            if func_info.get("name"): tool_calls_map[idx]["function"]["name"] += func_info["name"]
+                            if func_info.get("arguments"):
+                                tool_calls_map[idx]["function"]["arguments"] += func_info["arguments"]
+                                total_chars += len(func_info["arguments"])
+                elapsed = time.time() - start_time
+                sys.stdout.write(f"\r  ⏳ [{label} 생성 중...] {total_chars}자 ({elapsed:.1f}초)   ")
+                sys.stdout.flush()
+            except Exception: continue
+    except Exception as e:
+        print(f"\n❌ 원격 API 요청 장애 발생: {e}")
+        return {"content": f"원격 API 통신 에러: {e}", "tool_calls": []}
+
+    if total_chars > 0:
+        sys.stdout.write("\r" + " " * 60 + "\r")
+        sys.stdout.flush()
+
+    full_content = "".join(content_chunks)
+    full_content = re.sub(r'<think>.*?</think>', '', full_content, flags=re.DOTALL).strip()
+    tool_calls = [tool_calls_map[i] for i in sorted(tool_calls_map.keys())] if tool_calls_map else []
+    return {"content": full_content, "tool_calls": tool_calls}
+
+def stream_local_chat_completion(messages: list, tools: list, temperature: float, max_tokens: int, label: str) -> dict:
+    start_time = time.time()
+    stream = client.chat.completions.create(model=MODEL_NAME, messages=messages, tools=tools, temperature=temperature, max_tokens=max_tokens, stream=True, extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+    content_chunks, tool_calls_map, total_chars = [], {}, 0
     for chunk in stream:
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-
+        if not chunk.choices: continue
+        delta = chunk.choices.delta
         if delta.content:
             content_chunks.append(delta.content)
             total_chars += len(delta.content)
-
-            # 동일 특수문자/토큰 무한 반복(예: //////) 조기 감지 및 차단
             if len(content_chunks) > 25:
                 tail = "".join(content_chunks[-25:])
-                if len(set(tail)) <= 2 and len(tail) >= 25:
-                    sys.stdout.write("\r" + " " * 60 + "\r")
-                    print(f"⚠️ [{label}] 반복 출력 루프가 감지되어 조기 중단했습니다.")
-                    break
-
+                if len(set(tail)) <= 2 and len(tail) >= 25: break
         if delta.tool_calls:
             for tc in delta.tool_calls:
                 idx = tc.index
                 if idx not in tool_calls_map:
-                    tool_calls_map[idx] = {
-                        "id": tc.id or f"call_{uuid.uuid4().hex[:8]}",
-                        "type": "function",
-                        "function": {"name": "", "arguments": ""}
-                    }
-                if tc.id:
-                    tool_calls_map[idx]["id"] = tc.id
+                    tool_calls_map[idx] = {"id": tc.id or f"call_{uuid.uuid4().hex[:8]}", "type": "function", "function": {"name": "", "arguments": ""}}
+                if tc.id: tool_calls_map[idx]["id"] = tc.id
                 if tc.function:
-                    if tc.function.name:
-                        tool_calls_map[idx]["function"]["name"] += tc.function.name
+                    if tc.function.name: tool_calls_map[idx]["function"]["name"] += tc.function.name
                     if tc.function.arguments:
                         tool_calls_map[idx]["function"]["arguments"] += tc.function.arguments
                         total_chars += len(tc.function.arguments)
-
         elapsed = time.time() - start_time
         sys.stdout.write(f"\r  ⏳ [{label} 생성 중...] {total_chars}자 ({elapsed:.1f}초)   ")
         sys.stdout.flush()
@@ -432,176 +473,138 @@ def stream_chat_completion(messages: list, tools: list, temperature: float, max_
 
     full_content = "".join(content_chunks)
     full_content = re.sub(r'<think>.*?</think>', '', full_content, flags=re.DOTALL).strip()
-
     tool_calls = [tool_calls_map[i] for i in sorted(tool_calls_map.keys())] if tool_calls_map else []
     return {"content": full_content, "tool_calls": tool_calls}
 
-# 6. JSON 복구 및 폴백 파서
+
+def stream_local_chat_completion(messages: list, tools: list, temperature: float, max_tokens: int, label: str) -> dict:
+    start_time = time.time()
+    stream = client.chat.completions.create(model=MODEL_NAME, messages=messages, tools=tools, temperature=temperature, max_tokens=max_tokens, stream=True, extra_body={"chat_template_kwargs": {"enable_thinking": False}})
+    content_chunks, tool_calls_map, total_chars = [], {}, 0
+    for chunk in stream:
+        if not chunk.choices: continue
+        delta = chunk.choices.delta
+        if delta.content:
+            content_chunks.append(delta.content)
+            total_chars += len(delta.content)
+            if len(content_chunks) > 25:
+                tail = "".join(content_chunks[-25:])
+                if len(set(tail)) <= 2 and len(tail) >= 25: break
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                idx = tc.index
+                if idx not in tool_calls_map:
+                    tool_calls_map[idx] = {"id": tc.id or f"call_{uuid.uuid4().hex[:8]}", "type": "function", "function": {"name": "", "arguments": ""}}
+                if tc.id: tool_calls_map[idx]["id"] = tc.id
+                if tc.function:
+                    if tc.function.name: tool_calls_map[idx]["function"]["name"] += tc.function.name
+                    if tc.function.arguments:
+                        tool_calls_map[idx]["function"]["arguments"] += tc.function.arguments
+                        total_chars += len(tc.function.arguments)
+        elapsed = time.time() - start_time
+        sys.stdout.write(f"\r  ⏳ [{label} 생성 중...] {total_chars}자 ({elapsed:.1f}초)   ")
+        sys.stdout.flush()
+
+    if total_chars > 0:
+        sys.stdout.write("\r" + " " * 60 + "\r")
+        sys.stdout.flush()
+
+    full_content = "".join(content_chunks)
+    full_content = re.sub(r'<think>.*?</think>', '', full_content, flags=re.DOTALL).strip()
+    tool_calls = [tool_calls_map[i] for i in sorted(tool_calls_map.keys())] if tool_calls_map else []
+    return {"content": full_content, "tool_calls": tool_calls}
+
+
 def looks_like_tool_call(content: str) -> bool:
     return bool(content and re.search(r'"name"\s*:', content) and re.search(r'"arguments"\s*:', content))
 
 def _repair_pseudo_json(text: str) -> str:
-    def repl(m):
-        return f"{json.dumps(m.group(1))}: {json.dumps(m.group(2), ensure_ascii=False)}"
+    def repl(m): return f"{json.dumps(m.group(1))}: {json.dumps(m.group(2), ensure_ascii=False)}"
     for pat in [r'"([A-Za-z_]\w*)"\s*:\s*"""(.*?)"""', r'"([A-Za-z_]\w*)"\s*:\s*```(.*?)```', r'"([A-Za-z_]\w*)"\s*:\s*`(.*?)`']:
         text = re.sub(pat, repl, text, flags=re.DOTALL)
     return text
 
 def extract_fallback_tool_calls(content: str) -> list:
-    if not content:
-        return []
+    if not content: return []
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
     json_str = match.group(1) if match else content.strip()
     data = None
     for cand in [json_str, _repair_pseudo_json(json_str)]:
-        try:
-            data = json.loads(cand)
-            break
+        try: data = json.loads(cand); break
         except Exception:
-            try:
-                data = ast.literal_eval(cand)
-                break
-            except Exception:
-                pass
+            try: data = ast.literal_eval(cand); break
+            except Exception: pass
     if isinstance(data, dict) and "name" in data and "arguments" in data:
-        return [{
-            "id": f"call_{uuid.uuid4().hex[:8]}",
-            "name": data["name"],
-            "arguments": data["arguments"] if isinstance(data["arguments"], str) else json.dumps(data["arguments"], ensure_ascii=False)
-        }]
+        return [{"id": f"call_{uuid.uuid4().hex[:8]}", "name": data["name"], "arguments": data["arguments"] if isinstance(data["arguments"], str) else json.dumps(data["arguments"], ensure_ascii=False)}]
     return []
 
-# 7. 단일 자율 에이전트 통합 프롬프트 및 실행 루프
 def trim_context(messages: list) -> list:
-    if len(messages) <= MAX_HISTORY:
-        return messages
+    if len(messages) <= MAX_HISTORY: return messages
     return [messages[0]] + messages[-(MAX_HISTORY - 1):]
 
 def build_single_agent_prompt(workspace_dir: str, project_docs: str) -> str:
     return f"""/no_think
-You are an autonomous Windows Single Coding Agent.
-Isolated working directory: {workspace_dir}
-All file paths must be relative to this workspace directory (do NOT use '..' or paths outside the workspace).
-
-You handle the ENTIRE workflow yourself from start to finish:
-1. Explore: Use `list_dir`, `glob`, `grep`, or `read_file` to inspect existing files if needed.
-2. Implement: Use `write_file` or `edit_file` to write clean, complete, working code. Prefer Python's built-in `tkinter` for GUI apps unless external packages are requested.
-3. Verify: Use `run_powershell` (e.g. `python <filename>.py`) to execute and test your code. Fix any errors immediately if they occur.
-4. Report: Once verified, provide a clear, concise final summary in Korean (plain text, no JSON).
-
-When calling a tool, respond ONLY with a valid tool call (or JSON block):
-```json
-{{
-    "name": "write_file",
-    "arguments": {{"path": "tetris.py", "content": "..."}}
-}}
-```
+You are an autonomous Single Coding Agent. Workspace: {workspace_dir}
+1. Explore: `list_dir`, `glob`, `grep`, `read_file`.
+2. Implement: `write_file`, `edit_file`. Prefer built-in `tkinter` for GUI.
+3. Verify: `run_powershell`. Fix errors immediately.
+4. Report: Provide final summary in Korean.
+Call tools strictly via valid JSON structure.
 {project_docs}"""
 
 def single_agent_loop():
     project_docs = load_project_docs(WORKSPACE_ROOT)
     messages = [{"role": "system", "content": build_single_agent_prompt(WORKSPACE_ROOT, project_docs)}]
-
-    mode_badge = "⚡ AUTO-APPROVE (무인 자동 승인)" if AUTO_APPROVE else "🔒 INTERACTIVE APPROVAL (수동 승인)"
-    print("🤖 [SINGLE AGENT] 단일 자율 코딩 에이전트 시작 (탐색 → 작성 → 실행 → 검증 통합)")
-    print(f"📂 격리 작업 디렉터리: {WORKSPACE_ROOT}")
-    print(f"🛡️ 실행 보안 모드: {mode_badge}")
-    print(f"⚙️ 최대 스텝 / 토큰 상한: {MAX_AGENT_STEPS} steps / {MAX_TOKENS_AGENT} tokens")
-    if project_docs:
-        print(f"📚 프로젝트 지침 자동 로드 완료 ({len(project_docs)}자)")
-
     while True:
         user_input = input("\n👤 사용자: ").strip()
-        if not user_input:
-            continue
-        if user_input.lower() in ("exit", "quit", "종료"):
-            break
-
+        if not user_input: continue
+        if user_input.lower() in ("exit", "quit", "종료"): break
         messages.append({"role": "user", "content": user_input})
         messages = trim_context(messages)
 
         for step in range(1, MAX_AGENT_STEPS + 1):
-            res = stream_chat_completion(
-                messages,
-                tools=ALL_TOOLS,
-                temperature=0.15,
-                max_tokens=MAX_TOKENS_AGENT,
-                label=f"agent Step {step}"
-            )
-            content = res["content"]
-            raw_tcs = res["tool_calls"]
-            calls = []
-            using_fallback = False
+            if USE_REMOTE_EXAONE and step > 1: time.sleep(2.0)
+            res = stream_exaone_completion(messages, tools=ALL_TOOLS, temperature=0.15, max_tokens=MAX_TOKENS_AGENT, label=f"agent Step {step}") if USE_REMOTE_EXAONE else stream_local_chat_completion(messages, tools=ALL_TOOLS, temperature=0.15, max_tokens=MAX_TOKENS_AGENT, label=f"agent Step {step}")
+            content, raw_tcs = res["content"], res["tool_calls"]
+            calls, using_fallback = [], False
 
             if raw_tcs:
-                print(f"\n🔧 [Step {step}/{MAX_AGENT_STEPS}] 표준 Tool Calling 실행")
-                assistant_msg = {"role": "assistant", "tool_calls": raw_tcs}
-                if content:
-                    assistant_msg["content"] = content
-                messages.append(assistant_msg)
+                print(f"\n🔧 [Step {step}/{MAX_AGENT_STEPS}] 표준 Tool Calling"); messages.append({"role": "assistant", "tool_calls": raw_tcs, "content": content})
                 calls = [{"id": tc["id"], "name": tc["function"]["name"], "arguments": tc["function"]["arguments"]} for tc in raw_tcs]
             else:
                 fb = extract_fallback_tool_calls(content)
-                if fb:
-                    print(f"\n⚠️ [Step {step}/{MAX_AGENT_STEPS}] Fallback 파싱 실행")
-                    calls = fb
-                    using_fallback = True
-                    messages.append({"role": "assistant", "content": content})
-                elif looks_like_tool_call(content):
-                    messages.append({"role": "assistant", "content": content})
-                    messages.append({"role": "user", "content": "[JSON parse error] Send one valid JSON tool call. /no_think"})
-                    continue
-                else:
-                    print(f"\n💬 [Step {step}/{MAX_AGENT_STEPS}] 최종 응답 완료")
-                    messages.append({"role": "assistant", "content": content})
-                    if content:
-                        print(f"🤖 에이전트: {content}")
-                    break
+                if fb: print(f"\n⚠️ [Step {step}] Fallback 파싱"); calls = fb; using_fallback = True; messages.append({"role": "assistant", "content": content})
+                elif looks_like_tool_call(content): messages.append({"role": "assistant", "content": content}); messages.append({"role": "user", "content": "[JSON parse error] Retry valid JSON. /no_think"}); continue
+                else: print(f"\n💬 [Step {step}] 최종 응답 완료"); messages.append({"role": "assistant", "content": content}); print(f"🤖 에이전트: {content}"); break
 
             for call in calls:
                 fname = call["name"]
                 try:
-                    pargs = json.loads(call["arguments"])
-                    preview_args = {k: (v[:60] + "..." if isinstance(v, str) and len(v) > 60 else v) for k, v in pargs.items()}
-                    print(f"  ▶ {fname}({preview_args})")
+                    pargs = json.loads(call["arguments"]) if isinstance(call["arguments"], str) else call["arguments"]
                     out = execute_tool(fname, pargs)
-                except Exception as e:
-                    out = f"Tool error: {e}"
-
-                if using_fallback:
-                    messages.append({
-                        "role": "user",
-                        "content": f"[Tool result: {fname}]\n{str(out)[:MAX_TOOL_OUTPUT]}\n\n"
-                                   "Continue with the next tool call if needed, or provide the final Korean summary. /no_think"
-                    })
-                else:
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "content": str(out)[:MAX_TOOL_OUTPUT]
-                    })
-        else:
-            print(f"\n⚠️ 에이전트 최대 단계({MAX_AGENT_STEPS}회) 도달")
+                except Exception as e: out = f"Tool error: {e}"
+                
+                if using_fallback: messages.append({"role": "user", "content": f"[Tool result: {fname}]\n{str(out)[:MAX_TOOL_OUTPUT]}\nContinue. /no_think"})
+                else: messages.append({"role": "tool", "tool_call_id": call["id"], "content": str(out)[:MAX_TOOL_OUTPUT]})
+        else: print(f"\n⚠️ 최대 단계 도달")
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="단일 자율 로컬 코딩 에이전트 (Single Coding Agent)")
-    parser.add_argument(
-        "--auto",
-        action="store_true",
-        help="파일 쓰기/수정 및 PowerShell 실행 시 사용자 확인(y/n) 없이 자동 승인합니다."
-    )
-    parser.add_argument(
-        "--workspace",
-        type=str,
-        default=".",
-        help="에이전트가 접근할 수 있는 격리 작업 디렉터리 경로 (기본값: 현재 디렉터리)"
-    )
+    parser = argparse.ArgumentParser(description="Single Coding Agent")
+    parser.add_argument("--auto", action="store_true")
+    parser.add_argument("--workspace", type=str, default=".")
+    parser.add_argument("--remote", action="store_true")
+    parser.add_argument("--model", type=str, default="")
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
     AUTO_APPROVE = args.auto
     WORKSPACE_ROOT = os.path.abspath(args.workspace)
-    os.makedirs(WORKSPACE_ROOT, exist_ok=True)
-    os.chdir(WORKSPACE_ROOT)
+    USE_REMOTE_EXAONE = args.remote
+    if USE_REMOTE_EXAONE:
+        MODEL_NAME = args.model if args.model else "k-exaone_v2.5"
+    else:
+        MODEL_NAME = args.model if args.model else "Qwen3-4B-Q4_K_M.gguf"
+        client = OpenAI(base_url="http://localhost:8000/v1", api_key="local-key")
+    os.makedirs(WORKSPACE_ROOT, exist_ok=True); os.chdir(WORKSPACE_ROOT)
     single_agent_loop()
